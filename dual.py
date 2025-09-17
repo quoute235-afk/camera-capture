@@ -202,75 +202,114 @@ class DebugDualCapture:
         self.frame2 = None
         self.running = False
         
-        print(f"Initialisiere mit:")
-        print(f"  Kamera 1: Index {self.cam1_index}, Backend {self.cam1_backend}")
-        print(f"  Kamera 2: Index {self.cam2_index}, Backend {self.cam2_backend}")
-    
-    def safe_camera_init(self, index, backend, name):
+        print("Initialisiere mit:")
+        print(
+            f"  Kamera 1: Index {self.cam1_index}, Backend "
+            f"{_backend_to_string(self.cam1_backend)}"
+        )
+        print(
+            f"  Kamera 2: Index {self.cam2_index}, Backend "
+            f"{_backend_to_string(self.cam2_backend)}"
+        )
+
+    def safe_camera_init(self, index, backend, name, backend_attr):
         """Sichere Kamera-Initialisierung mit Fehlerbehandlung"""
         print(f"\nInitialisiere {name}...")
-        
-        try:
-            cap = cv2.VideoCapture(index, backend)
-            
+
+        candidate_backends = []
+
+        def add_backend(candidate):
+            if candidate is None:
+                return
+            if candidate not in candidate_backends:
+                candidate_backends.append(candidate)
+
+        add_backend(backend)
+        add_backend(cv2.CAP_ANY)
+        add_backend(cv2.CAP_MSMF)
+        add_backend(cv2.CAP_DSHOW)
+
+        for candidate in candidate_backends:
+            readable_backend = _backend_to_string(candidate)
+            print(f"  → Versuche Backend {readable_backend} (ID {candidate})")
+
+            try:
+                cap = cv2.VideoCapture(index, candidate)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print(f"    ✗ {name}: Exception beim Öffnen ({exc})")
+                continue
+
             if not cap.isOpened():
-                print(f"  ✗ {name}: Kann nicht geöffnet werden")
-                return None
-            
-            print(f"  ✓ {name}: Erfolgreich geöffnet")
-            
-            # Test Frame
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                print(f"  ✗ {name}: Kein Frame verfügbar")
+                print(f"    ✗ {name}: Kann mit Backend {readable_backend} nicht geöffnet werden")
                 cap.release()
-                return None
-            
-            print(f"  ✓ {name}: Frame OK ({frame.shape[1]}x{frame.shape[0]})")
-            
-            # 720p einstellen
-            print(f"  Stelle 720p für {name} ein...")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            # Verifizieren
-            time.sleep(0.5)  # Kurz warten
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            print(f"  ✓ {name}: Eingestellt auf {actual_w}x{actual_h} @ {actual_fps}fps")
-            
-            # Finaler Frame-Test
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print(f"  ✓ {name}: Finaler Test erfolgreich")
-                return cap
-            else:
-                print(f"  ✗ {name}: Finaler Test fehlgeschlagen")
+                continue
+
+            print(f"    ✓ {name}: Erfolgreich mit Backend {readable_backend} geöffnet")
+
+            try:
+                # Test Frame
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print(f"    ✗ {name}: Kein Frame verfügbar")
+                    cap.release()
+                    continue
+
+                print(f"    ✓ {name}: Frame OK ({frame.shape[1]}x{frame.shape[0]})")
+
+                # 720p einstellen
+                print(f"    Stelle 720p für {name} ein...")
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                # Verifizieren
+                time.sleep(0.5)  # Kurz warten
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+                print(
+                    f"    ✓ {name}: Eingestellt auf {actual_w}x{actual_h} @ {actual_fps}fps"
+                )
+
+                # Finaler Frame-Test
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"    ✓ {name}: Finaler Test erfolgreich")
+                    setattr(self, backend_attr, candidate)
+                    print(
+                        f"    → {name}: Verwende Backend {readable_backend}"
+                    )
+                    return cap
+
+                print(f"    ✗ {name}: Finaler Test fehlgeschlagen")
                 cap.release()
-                return None
-                
-        except Exception as e:
-            print(f"  ✗ {name}: Exception - {str(e)}")
-            return None
+            except Exception as exc:
+                print(f"    ✗ {name}: Ausnahme während Initialisierung ({exc})")
+                cap.release()
+
+        print(f"  ✗ {name}: Alle Backends fehlgeschlagen")
+        return None
     
     def initialize_cameras(self):
         """Initialisiert beide Kameras mit Debug-Output"""
         print("\n=== Kamera Initialisierung ===")
         
-        self.cap1 = self.safe_camera_init(self.cam1_index, self.cam1_backend, "Kamera 1")
+        self.cap1 = self.safe_camera_init(
+            self.cam1_index, self.cam1_backend, "Kamera 1", "cam1_backend"
+        )
         if not self.cap1:
             print("FEHLER: Kamera 1 Initialisierung fehlgeschlagen!")
             return False
-        
-        self.cap2 = self.safe_camera_init(self.cam2_index, self.cam2_backend, "Kamera 2")
+
+        self.cap2 = self.safe_camera_init(
+            self.cam2_index, self.cam2_backend, "Kamera 2", "cam2_backend"
+        )
         if not self.cap2:
             print("FEHLER: Kamera 2 Initialisierung fehlgeschlagen!")
             return False
-        
+
         print("\n✓ Beide Kameras erfolgreich initialisiert!")
         
         # Auto-Fokus mit Debug
