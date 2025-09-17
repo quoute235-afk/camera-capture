@@ -3,8 +3,18 @@ import numpy as np
 import threading
 import time
 from datetime import datetime
-import os
-import sys
+from typing import Sequence, Tuple
+
+CameraConfig = Tuple[int, int]
+
+REQUIRED_CAMERA_COUNT = 4
+DEFAULT_POSITIONS = (2, 3)
+MAX_SELECTION_ATTEMPTS = 3
+BACKEND_NAMES = {
+    cv2.CAP_DSHOW: "DirectShow",
+    cv2.CAP_MSMF: "Media Foundation",
+    cv2.CAP_ANY: "Auto",
+}
 
 def test_single_camera(index):
     """Testet eine einzelne Kamera ausführlich"""
@@ -54,7 +64,7 @@ def comprehensive_camera_scan():
     """Umfassender Kamera-Scan"""
     print("=== Umfassender Kamera-Scan ===")
     working_cameras = []
-    
+
     for i in range(10):  # Teste mehr Indizes
         print(f"\nScanne Index {i}...")
         success, backend = test_single_camera(i)
@@ -69,8 +79,114 @@ def comprehensive_camera_scan():
     print(f"Gefundene Kameras: {len(working_cameras)}")
     for idx, backend in working_cameras:
         print(f"  Index {idx}: Backend {backend}")
-    
+
     return working_cameras
+
+
+def _backend_to_string(backend):
+    """Hilfsfunktion zur lesbaren Darstellung der Backend-Information."""
+    if isinstance(backend, str):
+        return backend
+    return BACKEND_NAMES.get(backend, f"ID {backend}")
+
+
+def display_working_cameras(working_cameras: Sequence[CameraConfig]) -> None:
+    """Gibt alle gefundenen Kameras mit Indexposition aus."""
+    print("\nVerfügbare Kameras:")
+    for pos, (idx, backend) in enumerate(working_cameras):
+        print(f"  [{pos}] Index {idx} - Backend {_backend_to_string(backend)}")
+
+
+def _default_camera_configs(working_cameras: Sequence[CameraConfig],
+                            default_positions: Tuple[int, int]) -> Tuple[CameraConfig, CameraConfig]:
+    """Ermittelt die Standardkamerakonfigurationen basierend auf den Positionen."""
+    return (
+        working_cameras[default_positions[0]],
+        working_cameras[default_positions[1]],
+    )
+
+
+def choose_camera_configs(
+    working_cameras: Sequence[CameraConfig],
+    default_positions: Tuple[int, int] = DEFAULT_POSITIONS,
+    attempts: int = MAX_SELECTION_ATTEMPTS,
+) -> Tuple[CameraConfig, CameraConfig]:
+    """Ermöglicht die Auswahl von zwei Kameras aus der Scan-Liste.
+
+    Der Benutzer kann die Standardpositionen übernehmen oder zwei gültige Positionen eingeben.
+    Bei ungültiger Eingabe wird bis zu ``attempts``-mal nachgefragt und schließlich die
+    Standardauswahl verwendet.
+    """
+
+    if len(working_cameras) <= max(default_positions):
+        raise ValueError(
+            "Zu wenige Kameras gefunden, um die Standardpositionen abzudecken."
+        )
+
+    prompt = (
+        "\nGib zwei Kamera-Positionen (durch Komma getrennt) ein oder drücke Enter "
+        f"für Standard ({default_positions[0]},{default_positions[1]}): "
+    )
+
+    remaining_attempts = max(1, attempts)
+    while remaining_attempts:
+        selection = input(prompt).strip()
+        if not selection:
+            return _default_camera_configs(working_cameras, default_positions)
+
+        try:
+            parts = [p.strip() for p in selection.replace(';', ',').split(',') if p.strip()]
+            if len(parts) != 2:
+                raise ValueError("Es müssen genau zwei Positionen angegeben werden.")
+
+            chosen_positions = [int(p) for p in parts]
+            if len(set(chosen_positions)) != 2:
+                raise ValueError("Bitte zwei unterschiedliche Positionen wählen.")
+
+            if any(p < 0 or p >= len(working_cameras) for p in chosen_positions):
+                raise ValueError("Eingegebene Position außerhalb des gültigen Bereichs.")
+
+            return (
+                working_cameras[chosen_positions[0]],
+                working_cameras[chosen_positions[1]],
+            )
+
+        except ValueError as exc:
+            remaining_attempts -= 1
+            if remaining_attempts:
+                print(
+                    "⚠️ Ungültige Eingabe ({}). Versuche es erneut oder drücke Enter für die "
+                    "Standardauswahl.".format(exc)
+                )
+            else:
+                print(
+                    "⚠️ Ungültige Eingabe ({}). Verwende Standardauswahl.".format(exc)
+                )
+
+    return _default_camera_configs(working_cameras, default_positions)
+
+
+def preview_single_camera(camera_config: CameraConfig) -> None:
+    """Zeigt ein einzelnes Kamerabild als Diagnose an."""
+    idx, backend = camera_config
+    print("\nTeste einzelne Kamera...")
+    cap = cv2.VideoCapture(idx, backend)
+    try:
+        if not cap.isOpened():
+            print("  ✗ Kamera konnte nicht geöffnet werden.")
+            return
+
+        ret, frame = cap.read()
+        if not ret:
+            print("  ✗ Kein Frame verfügbar.")
+            return
+
+        cv2.imshow('Einzelne Kamera Test', cv2.resize(frame, (640, 480)))
+        print("Drücke eine Taste zum Beenden...")
+        cv2.waitKey(0)
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 class DebugDualCapture:
     def __init__(self, cam1_config, cam2_config):
@@ -86,75 +202,114 @@ class DebugDualCapture:
         self.frame2 = None
         self.running = False
         
-        print(f"Initialisiere mit:")
-        print(f"  Kamera 1: Index {self.cam1_index}, Backend {self.cam1_backend}")
-        print(f"  Kamera 2: Index {self.cam2_index}, Backend {self.cam2_backend}")
-    
-    def safe_camera_init(self, index, backend, name):
+        print("Initialisiere mit:")
+        print(
+            f"  Kamera 1: Index {self.cam1_index}, Backend "
+            f"{_backend_to_string(self.cam1_backend)}"
+        )
+        print(
+            f"  Kamera 2: Index {self.cam2_index}, Backend "
+            f"{_backend_to_string(self.cam2_backend)}"
+        )
+
+    def safe_camera_init(self, index, backend, name, backend_attr):
         """Sichere Kamera-Initialisierung mit Fehlerbehandlung"""
         print(f"\nInitialisiere {name}...")
-        
-        try:
-            cap = cv2.VideoCapture(index, backend)
-            
+
+        candidate_backends = []
+
+        def add_backend(candidate):
+            if candidate is None:
+                return
+            if candidate not in candidate_backends:
+                candidate_backends.append(candidate)
+
+        add_backend(backend)
+        add_backend(cv2.CAP_ANY)
+        add_backend(cv2.CAP_MSMF)
+        add_backend(cv2.CAP_DSHOW)
+
+        for candidate in candidate_backends:
+            readable_backend = _backend_to_string(candidate)
+            print(f"  → Versuche Backend {readable_backend} (ID {candidate})")
+
+            try:
+                cap = cv2.VideoCapture(index, candidate)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print(f"    ✗ {name}: Exception beim Öffnen ({exc})")
+                continue
+
             if not cap.isOpened():
-                print(f"  ✗ {name}: Kann nicht geöffnet werden")
-                return None
-            
-            print(f"  ✓ {name}: Erfolgreich geöffnet")
-            
-            # Test Frame
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                print(f"  ✗ {name}: Kein Frame verfügbar")
+                print(f"    ✗ {name}: Kann mit Backend {readable_backend} nicht geöffnet werden")
                 cap.release()
-                return None
-            
-            print(f"  ✓ {name}: Frame OK ({frame.shape[1]}x{frame.shape[0]})")
-            
-            # 720p einstellen
-            print(f"  Stelle 720p für {name} ein...")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            # Verifizieren
-            time.sleep(0.5)  # Kurz warten
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            print(f"  ✓ {name}: Eingestellt auf {actual_w}x{actual_h} @ {actual_fps}fps")
-            
-            # Finaler Frame-Test
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                print(f"  ✓ {name}: Finaler Test erfolgreich")
-                return cap
-            else:
-                print(f"  ✗ {name}: Finaler Test fehlgeschlagen")
+                continue
+
+            print(f"    ✓ {name}: Erfolgreich mit Backend {readable_backend} geöffnet")
+
+            try:
+                # Test Frame
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print(f"    ✗ {name}: Kein Frame verfügbar")
+                    cap.release()
+                    continue
+
+                print(f"    ✓ {name}: Frame OK ({frame.shape[1]}x{frame.shape[0]})")
+
+                # 720p einstellen
+                print(f"    Stelle 720p für {name} ein...")
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                # Verifizieren
+                time.sleep(0.5)  # Kurz warten
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+                print(
+                    f"    ✓ {name}: Eingestellt auf {actual_w}x{actual_h} @ {actual_fps}fps"
+                )
+
+                # Finaler Frame-Test
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    print(f"    ✓ {name}: Finaler Test erfolgreich")
+                    setattr(self, backend_attr, candidate)
+                    print(
+                        f"    → {name}: Verwende Backend {readable_backend}"
+                    )
+                    return cap
+
+                print(f"    ✗ {name}: Finaler Test fehlgeschlagen")
                 cap.release()
-                return None
-                
-        except Exception as e:
-            print(f"  ✗ {name}: Exception - {str(e)}")
-            return None
+            except Exception as exc:
+                print(f"    ✗ {name}: Ausnahme während Initialisierung ({exc})")
+                cap.release()
+
+        print(f"  ✗ {name}: Alle Backends fehlgeschlagen")
+        return None
     
     def initialize_cameras(self):
         """Initialisiert beide Kameras mit Debug-Output"""
         print("\n=== Kamera Initialisierung ===")
         
-        self.cap1 = self.safe_camera_init(self.cam1_index, self.cam1_backend, "Kamera 1")
+        self.cap1 = self.safe_camera_init(
+            self.cam1_index, self.cam1_backend, "Kamera 1", "cam1_backend"
+        )
         if not self.cap1:
             print("FEHLER: Kamera 1 Initialisierung fehlgeschlagen!")
             return False
-        
-        self.cap2 = self.safe_camera_init(self.cam2_index, self.cam2_backend, "Kamera 2")
+
+        self.cap2 = self.safe_camera_init(
+            self.cam2_index, self.cam2_backend, "Kamera 2", "cam2_backend"
+        )
         if not self.cap2:
             print("FEHLER: Kamera 2 Initialisierung fehlgeschlagen!")
             return False
-        
+
         print("\n✓ Beide Kameras erfolgreich initialisiert!")
         
         # Auto-Fokus mit Debug
@@ -356,32 +511,26 @@ def main():
         # Umfassender Kamera-Scan
         working_cameras = comprehensive_camera_scan()
         
-        if len(working_cameras) < 2:
+        if len(working_cameras) < REQUIRED_CAMERA_COUNT:
             print(f"\n❌ FEHLER: Nur {len(working_cameras)} Kamera(s) gefunden!")
-            print("Für Dual-Capture werden 2 Kameras benötigt.")
-            
+            print(
+                "Für Dual-Capture werden mindestens "
+                f"{REQUIRED_CAMERA_COUNT} Kameras benötigt, damit die Standardauswahl "
+                f"({DEFAULT_POSITIONS[0]},{DEFAULT_POSITIONS[1]}) verfügbar ist."
+            )
+
             if len(working_cameras) == 1:
-                print("\nTeste einzelne Kamera...")
-                idx, backend = working_cameras[0]
-                cap = cv2.VideoCapture(idx, backend)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret:
-                        cv2.imshow('Einzelne Kamera Test', cv2.resize(frame, (640, 480)))
-                        print("Drücke eine Taste zum Beenden...")
-                        cv2.waitKey(0)
-                        cv2.destroyAllWindows()
-                cap.release()
-            
+                preview_single_camera(working_cameras[0])
+
             input("\nDrücke Enter zum Beenden...")
             return
-        
+
         print(f"\n✓ {len(working_cameras)} Kameras gefunden!")
-        
-        # Erste zwei Kameras für Dual-Capture verwenden
-        cam1_config = working_cameras[0]
-        cam2_config = working_cameras[1]
-        
+
+        display_working_cameras(working_cameras)
+
+        cam1_config, cam2_config = choose_camera_configs(working_cameras)
+
         print(f"\nVerwende für Dual-Capture:")
         print(f"  Kamera 1: Index {cam1_config[0]}")
         print(f"  Kamera 2: Index {cam2_config[0]}")
