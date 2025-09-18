@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from camera_capture import MultiCameraCapture
-from filters import detect_small_circles, invert
+from filters import detect_small_circles, invert, merge_inverted_canny
 
 
 class DualInvertApp:
@@ -73,7 +73,7 @@ class DualInvertApp:
 
         self._labels: Dict[int, Dict[str, ttk.Label]] = {}
 
-        max_column_index = 2 if 0 in self._camera_indices else 1
+        max_column_index = 3 if 0 in self._camera_indices else 1
 
         for row, index in enumerate(self._camera_indices):
             row_labels: Dict[str, ttk.Label] = {
@@ -85,8 +85,11 @@ class DualInvertApp:
                 ),
             }
             if index == 0:
+                row_labels["canny_merge"] = self._create_image_panel(
+                    video_frame, "Kamera 1 - Canny Merge", row, 2
+                )
                 row_labels["circles"] = self._create_image_panel(
-                    video_frame, "Kamera 1 - Kreiserkennung", row, 2
+                    video_frame, "Kamera 1 - Kreiserkennung", row, 3
                 )
             self._labels[index] = row_labels
 
@@ -205,13 +208,17 @@ class DualInvertApp:
                 if index in self._labels:
                     self._clear_image(self._labels[index]["original"], (index, "original"))
                     self._clear_image(self._labels[index]["inverted"], (index, "inverted"))
+                    if "canny_merge" in self._labels[index]:
+                        self._clear_image(
+                            self._labels[index]["canny_merge"], (index, "canny_merge")
+                        )
                     if "circles" in self._labels[index]:
                         self._clear_image(
                             self._labels[index]["circles"], (index, "circles")
                         )
                 self._last_frames.pop(index, None)
 
-            if 0 in self._labels and "circles" in self._labels[0]:
+            if 0 in self._labels:
                 if 0 in frames:
                     secondary_inverted = None
                     for other_index in self._camera_indices:
@@ -221,22 +228,52 @@ class DualInvertApp:
                             secondary_inverted = inverted_views[other_index]
                             break
 
-                    circle_view = detect_small_circles(
-                        frames[0],
-                        inverted_views.get(0),
-                        secondary_inverted,
-                    )
-                    self._last_frames.setdefault(0, {})
-                    self._last_frames[0]["circles"] = circle_view.copy()
-                    self._update_image(
-                        self._labels[0]["circles"],
-                        circle_view,
-                        (0, "circles"),
-                    )
+                    primary_inverted = inverted_views.get(0)
+
+                    if "canny_merge" in self._labels[0] and primary_inverted is not None:
+                        canny_view = merge_inverted_canny(
+                            primary_inverted, secondary_inverted
+                        )
+                        if canny_view is None:
+                            canny_view = np.zeros_like(frames[0])
+                        self._last_frames.setdefault(0, {})
+                        self._last_frames[0]["canny_merge"] = canny_view.copy()
+                        self._update_image(
+                            self._labels[0]["canny_merge"],
+                            canny_view,
+                            (0, "canny_merge"),
+                        )
+                    elif "canny_merge" in self._labels[0]:
+                        self._clear_image(
+                            self._labels[0]["canny_merge"], (0, "canny_merge")
+                        )
+                        if 0 in self._last_frames:
+                            self._last_frames[0].pop("canny_merge", None)
+
+                    if "circles" in self._labels[0]:
+                        circle_view = detect_small_circles(
+                            frames[0],
+                            primary_inverted,
+                            secondary_inverted,
+                        )
+                        self._last_frames.setdefault(0, {})
+                        self._last_frames[0]["circles"] = circle_view.copy()
+                        self._update_image(
+                            self._labels[0]["circles"],
+                            circle_view,
+                            (0, "circles"),
+                        )
                 else:
-                    self._clear_image(self._labels[0]["circles"], (0, "circles"))
-                    if 0 in self._last_frames:
-                        self._last_frames[0].pop("circles", None)
+                    if "canny_merge" in self._labels[0]:
+                        self._clear_image(
+                            self._labels[0]["canny_merge"], (0, "canny_merge")
+                        )
+                        if 0 in self._last_frames:
+                            self._last_frames[0].pop("canny_merge", None)
+                    if "circles" in self._labels[0]:
+                        self._clear_image(self._labels[0]["circles"], (0, "circles"))
+                        if 0 in self._last_frames:
+                            self._last_frames[0].pop("circles", None)
 
         self.root.after(33, self._update_loop)
 

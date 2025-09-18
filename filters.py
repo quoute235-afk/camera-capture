@@ -32,6 +32,40 @@ def invert(frame: np.ndarray) -> np.ndarray:
     return inverted_bgr
 
 
+def merge_inverted_canny(
+    inverted_primary: np.ndarray | None,
+    inverted_secondary: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Return the combined Canny edges from two inverted views as a BGR frame.
+
+    The function expects the already inverted views of camera 0 and camera 1.
+    Both frames are converted to grayscale, passed through Canny edge detection,
+    and merged with a bitwise OR operation. The resulting edge map is converted
+    back to BGR so it can be displayed within the GUI alongside other views.
+    If the secondary view is unavailable, only the primary edges are returned.
+    """
+
+    if inverted_primary is None or inverted_primary.ndim != 3:
+        return None
+
+    height, width = inverted_primary.shape[:2]
+    primary_gray = cv2.cvtColor(inverted_primary, cv2.COLOR_BGR2GRAY)
+    primary_edges = cv2.Canny(primary_gray, 60, 180)
+
+    combined_edges = primary_edges
+
+    if inverted_secondary is not None and inverted_secondary.ndim == 3:
+        if inverted_secondary.shape[:2] != (height, width):
+            resized_secondary = cv2.resize(inverted_secondary, (width, height))
+        else:
+            resized_secondary = inverted_secondary
+        secondary_gray = cv2.cvtColor(resized_secondary, cv2.COLOR_BGR2GRAY)
+        secondary_edges = cv2.Canny(secondary_gray, 60, 180)
+        combined_edges = cv2.bitwise_or(primary_edges, secondary_edges)
+
+    return cv2.cvtColor(combined_edges, cv2.COLOR_GRAY2BGR)
+
+
 def _fit_circle_least_squares(points: np.ndarray) -> Tuple[float, float, float]:
     """Return the centre and radius of the least-squares circle through *points*."""
 
