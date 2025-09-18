@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from camera_capture import MultiCameraCapture
-from filters import invert
+from filters import detect_small_circles, invert
 
 
 class DualInvertApp:
@@ -73,8 +73,10 @@ class DualInvertApp:
 
         self._labels: Dict[int, Dict[str, ttk.Label]] = {}
 
+        max_column_index = 2 if 0 in self._camera_indices else 1
+
         for row, index in enumerate(self._camera_indices):
-            self._labels[index] = {
+            row_labels: Dict[str, ttk.Label] = {
                 "original": self._create_image_panel(
                     video_frame, f"Kamera {row + 1} - Original", row, 0
                 ),
@@ -82,10 +84,15 @@ class DualInvertApp:
                     video_frame, f"Kamera {row + 1} - Invertiert", row, 1
                 ),
             }
+            if index == 0:
+                row_labels["circles"] = self._create_image_panel(
+                    video_frame, "Kamera 1 - Kreiserkennung", row, 2
+                )
+            self._labels[index] = row_labels
 
         for row in range(len(self._camera_indices)):
             video_frame.grid_rowconfigure(row, weight=1)
-        for column in range(2):
+        for column in range(max_column_index + 1):
             video_frame.grid_columnconfigure(column, weight=1)
 
     def _create_image_panel(
@@ -172,6 +179,15 @@ class DualInvertApp:
                     self._last_frames[index]["original"] = original_frame
                     self._last_frames[index]["inverted"] = inverted.copy()
 
+                    if index == 0 and "circles" in self._labels[index]:
+                        circle_view = detect_small_circles(frame)
+                        self._last_frames[index]["circles"] = circle_view.copy()
+                        self._update_image(
+                            self._labels[index]["circles"],
+                            circle_view,
+                            (index, "circles"),
+                        )
+
                     self._update_image(
                         self._labels[index]["original"],
                         original_frame,
@@ -185,6 +201,10 @@ class DualInvertApp:
                 else:
                     self._clear_image(self._labels[index]["original"], (index, "original"))
                     self._clear_image(self._labels[index]["inverted"], (index, "inverted"))
+                    if "circles" in self._labels[index]:
+                        self._clear_image(
+                            self._labels[index]["circles"], (index, "circles")
+                        )
                     self._last_frames.pop(index, None)
 
         self.root.after(33, self._update_loop)
