@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from camera_capture import MultiCameraCapture
-from filters import detect_small_circles, invert, merge_inverted_canny
+from filters import canny_edges, denoise, invert
 
 
 class DualInvertApp:
@@ -73,23 +73,22 @@ class DualInvertApp:
 
         self._labels: Dict[int, Dict[str, ttk.Label]] = {}
 
-        max_column_index = 3 if 0 in self._camera_indices else 1
+        panel_config = [
+            ("original", "Original"),
+            ("denoised", "Rauschreduziert"),
+            ("inverted", "Invertiert"),
+            ("canny", "Canny"),
+        ]
+        max_column_index = len(panel_config) - 1
 
         for row, index in enumerate(self._camera_indices):
-            row_labels: Dict[str, ttk.Label] = {
-                "original": self._create_image_panel(
-                    video_frame, f"Kamera {row + 1} - Original", row, 0
-                ),
-                "inverted": self._create_image_panel(
-                    video_frame, f"Kamera {row + 1} - Invertiert", row, 1
-                ),
-            }
-            if index == 0:
-                row_labels["canny_merge"] = self._create_image_panel(
-                    video_frame, "Kamera 1 - Canny Merge", row, 2
-                )
-                row_labels["circles"] = self._create_image_panel(
-                    video_frame, "Kamera 1 - Kreiserkennung", row, 3
+            row_labels: Dict[str, ttk.Label] = {}
+            for column, (key, title_suffix) in enumerate(panel_config):
+                row_labels[key] = self._create_image_panel(
+                    video_frame,
+                    f"Kamera {row + 1} - {title_suffix}",
+                    row,
+                    column,
                 )
             self._labels[index] = row_labels
 
@@ -173,7 +172,9 @@ class DualInvertApp:
     def _update_loop(self) -> None:
         if self._capture.is_running():
             frames: Dict[int, np.ndarray] = {}
+            denoised_views: Dict[int, np.ndarray] = {}
             inverted_views: Dict[int, np.ndarray] = {}
+            canny_views: Dict[int, np.ndarray] = {}
             missing_indices: List[int] = []
 
             for index in self._camera_indices:
@@ -183,14 +184,20 @@ class DualInvertApp:
                     continue
 
                 original_frame = frame.copy()
-                inverted = invert(frame)
+                denoised = denoise(original_frame)
+                inverted = invert(denoised)
+                canny_view = canny_edges(denoised)
 
                 frames[index] = original_frame
+                denoised_views[index] = denoised
                 inverted_views[index] = inverted
+                canny_views[index] = canny_view
 
                 self._last_frames.setdefault(index, {})
                 self._last_frames[index]["original"] = original_frame.copy()
+                self._last_frames[index]["denoised"] = denoised.copy()
                 self._last_frames[index]["inverted"] = inverted.copy()
+                self._last_frames[index]["canny"] = canny_view.copy()
 
             for index, original_frame in frames.items():
                 self._update_image(
@@ -199,81 +206,27 @@ class DualInvertApp:
                     (index, "original"),
                 )
                 self._update_image(
+                    self._labels[index]["denoised"],
+                    denoised_views[index],
+                    (index, "denoised"),
+                )
+                self._update_image(
                     self._labels[index]["inverted"],
                     inverted_views[index],
                     (index, "inverted"),
                 )
+                self._update_image(
+                    self._labels[index]["canny"],
+                    canny_views[index],
+                    (index, "canny"),
+                )
 
             for index in missing_indices:
                 if index in self._labels:
-                    self._clear_image(self._labels[index]["original"], (index, "original"))
-                    self._clear_image(self._labels[index]["inverted"], (index, "inverted"))
-                    if "canny_merge" in self._labels[index]:
-                        self._clear_image(
-                            self._labels[index]["canny_merge"], (index, "canny_merge")
-                        )
-                    if "circles" in self._labels[index]:
-                        self._clear_image(
-                            self._labels[index]["circles"], (index, "circles")
-                        )
+                    for key in ("original", "denoised", "inverted", "canny"):
+                        if key in self._labels[index]:
+                            self._clear_image(self._labels[index][key], (index, key))
                 self._last_frames.pop(index, None)
-
-            if 0 in self._labels:
-                if 0 in frames:
-                    secondary_inverted = None
-                    for other_index in self._camera_indices:
-                        if other_index == 0:
-                            continue
-                        if other_index in inverted_views:
-                            secondary_inverted = inverted_views[other_index]
-                            break
-
-                    primary_inverted = inverted_views.get(0)
-
-                    if "canny_merge" in self._labels[0] and primary_inverted is not None:
-                        canny_view = merge_inverted_canny(
-                            primary_inverted, secondary_inverted
-                        )
-                        if canny_view is None:
-                            canny_view = np.zeros_like(frames[0])
-                        self._last_frames.setdefault(0, {})
-                        self._last_frames[0]["canny_merge"] = canny_view.copy()
-                        self._update_image(
-                            self._labels[0]["canny_merge"],
-                            canny_view,
-                            (0, "canny_merge"),
-                        )
-                    elif "canny_merge" in self._labels[0]:
-                        self._clear_image(
-                            self._labels[0]["canny_merge"], (0, "canny_merge")
-                        )
-                        if 0 in self._last_frames:
-                            self._last_frames[0].pop("canny_merge", None)
-
-                    if "circles" in self._labels[0]:
-                        circle_view = detect_small_circles(
-                            frames[0],
-                            primary_inverted,
-                            secondary_inverted,
-                        )
-                        self._last_frames.setdefault(0, {})
-                        self._last_frames[0]["circles"] = circle_view.copy()
-                        self._update_image(
-                            self._labels[0]["circles"],
-                            circle_view,
-                            (0, "circles"),
-                        )
-                else:
-                    if "canny_merge" in self._labels[0]:
-                        self._clear_image(
-                            self._labels[0]["canny_merge"], (0, "canny_merge")
-                        )
-                        if 0 in self._last_frames:
-                            self._last_frames[0].pop("canny_merge", None)
-                    if "circles" in self._labels[0]:
-                        self._clear_image(self._labels[0]["circles"], (0, "circles"))
-                        if 0 in self._last_frames:
-                            self._last_frames[0].pop("circles", None)
 
         self.root.after(33, self._update_loop)
 
