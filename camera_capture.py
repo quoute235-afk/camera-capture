@@ -45,6 +45,9 @@ class MultiCameraCapture:
                 capture.release()
                 success = False
                 break
+
+            # Limit the capture rate to 10 frames per second when supported.
+            capture.set(cv2.CAP_PROP_FPS, 10)
             opened[index] = capture
 
         if not success:

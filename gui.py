@@ -12,11 +12,11 @@ import tkinter as tk
 from tkinter import ttk
 
 from camera_capture import MultiCameraCapture
-from filters import canny_edges, denoise, invert
+from filters import canny_from_inverted, invert_grayscale
 
 
 class DualInvertApp:
-    """GUI application showing original and inverted views for cameras."""
+    """GUI application showing original and processed views for cameras."""
 
     def __init__(
         self,
@@ -75,9 +75,8 @@ class DualInvertApp:
 
         panel_config = [
             ("original", "Original"),
-            ("denoised", "Rauschreduziert"),
-            ("inverted", "Invertiert"),
-            ("canny", "Canny"),
+            ("inverted", "Invertiert (Graustufen)"),
+            ("canny", "Canny (Invertiert)"),
         ]
         max_column_index = len(panel_config) - 1
 
@@ -172,7 +171,6 @@ class DualInvertApp:
     def _update_loop(self) -> None:
         if self._capture.is_running():
             frames: Dict[int, np.ndarray] = {}
-            denoised_views: Dict[int, np.ndarray] = {}
             inverted_views: Dict[int, np.ndarray] = {}
             canny_views: Dict[int, np.ndarray] = {}
             missing_indices: List[int] = []
@@ -184,18 +182,15 @@ class DualInvertApp:
                     continue
 
                 original_frame = frame.copy()
-                denoised = denoise(original_frame)
-                inverted = invert(denoised)
-                canny_view = canny_edges(denoised)
+                inverted = invert_grayscale(original_frame)
+                canny_view = canny_from_inverted(inverted)
 
                 frames[index] = original_frame
-                denoised_views[index] = denoised
                 inverted_views[index] = inverted
                 canny_views[index] = canny_view
 
                 self._last_frames.setdefault(index, {})
                 self._last_frames[index]["original"] = original_frame.copy()
-                self._last_frames[index]["denoised"] = denoised.copy()
                 self._last_frames[index]["inverted"] = inverted.copy()
                 self._last_frames[index]["canny"] = canny_view.copy()
 
@@ -204,11 +199,6 @@ class DualInvertApp:
                     self._labels[index]["original"],
                     original_frame,
                     (index, "original"),
-                )
-                self._update_image(
-                    self._labels[index]["denoised"],
-                    denoised_views[index],
-                    (index, "denoised"),
                 )
                 self._update_image(
                     self._labels[index]["inverted"],
@@ -223,12 +213,12 @@ class DualInvertApp:
 
             for index in missing_indices:
                 if index in self._labels:
-                    for key in ("original", "denoised", "inverted", "canny"):
+                    for key in ("original", "inverted", "canny"):
                         if key in self._labels[index]:
                             self._clear_image(self._labels[index][key], (index, key))
                 self._last_frames.pop(index, None)
 
-        self.root.after(33, self._update_loop)
+        self.root.after(100, self._update_loop)
 
     def _update_image(self, label: ttk.Label, frame, key: Tuple[int, str]) -> None:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
