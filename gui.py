@@ -4,7 +4,8 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+import time
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -30,6 +31,9 @@ class DualInvertApp:
         self._capture = MultiCameraCapture(self._camera_indices)
         self._photo_images: Dict[Tuple[int, str], tk.PhotoImage] = {}
         self._last_frames: Dict[int, Dict[str, np.ndarray]] = {}
+        self._live_interval_ms = 33  # ~30 FPS for the live preview
+        self._canny_interval_ms = 150  # ~6-7 FPS for the Canny view
+        self._last_canny_timestamp: Optional[float] = None
 
         self.status_var = tk.StringVar(value="Inaktiv. Bitte 'Start' drücken.")
 
@@ -75,7 +79,6 @@ class DualInvertApp:
 
         panel_config = [
             ("original", "Original"),
-            ("inverted", "Invertiert (Graustufen)"),
             ("canny", "Canny (Invertiert)"),
         ]
         max_column_index = len(panel_config) - 1
@@ -124,10 +127,12 @@ class DualInvertApp:
             return
 
         self.status_var.set("Live-Ansicht aktiv.")
+        self._last_canny_timestamp = None
 
     def stop_cameras(self) -> None:
         self._capture.stop()
         self.status_var.set("Aufnahme gestoppt.")
+        self._last_canny_timestamp = None
 
     def on_close(self) -> None:
         self.stop_cameras()
@@ -171,9 +176,17 @@ class DualInvertApp:
     def _update_loop(self) -> None:
         if self._capture.is_running():
             frames: Dict[int, np.ndarray] = {}
-            inverted_views: Dict[int, np.ndarray] = {}
             canny_views: Dict[int, np.ndarray] = {}
+            canny_refresh: List[int] = []
             missing_indices: List[int] = []
+
+            now = time.perf_counter()
+            update_canny = (
+                self._last_canny_timestamp is None
+                or (now - self._last_canny_timestamp) * 1000 >= self._canny_interval_ms
+            )
+            if update_canny:
+                self._last_canny_timestamp = now
 
             for index in self._camera_indices:
                 frame = self._capture.read(index)
@@ -182,17 +195,21 @@ class DualInvertApp:
                     continue
 
                 original_frame = frame.copy()
-                inverted = invert_grayscale(original_frame)
-                canny_view = canny_from_inverted(inverted)
-
                 frames[index] = original_frame
-                inverted_views[index] = inverted
-                canny_views[index] = canny_view
 
                 self._last_frames.setdefault(index, {})
                 self._last_frames[index]["original"] = original_frame.copy()
-                self._last_frames[index]["inverted"] = inverted.copy()
-                self._last_frames[index]["canny"] = canny_view.copy()
+
+                stored_canny = self._last_frames[index].get("canny")
+                refresh_canny = update_canny or stored_canny is None
+                if refresh_canny:
+                    inverted = invert_grayscale(original_frame)
+                    stored_canny = canny_from_inverted(inverted)
+                    self._last_frames[index]["canny"] = stored_canny.copy()
+                if stored_canny is not None:
+                    canny_views[index] = stored_canny
+                    if refresh_canny:
+                        canny_refresh.append(index)
 
             for index, original_frame in frames.items():
                 self._update_image(
@@ -200,11 +217,7 @@ class DualInvertApp:
                     original_frame,
                     (index, "original"),
                 )
-                self._update_image(
-                    self._labels[index]["inverted"],
-                    inverted_views[index],
-                    (index, "inverted"),
-                )
+            for index in canny_refresh:
                 self._update_image(
                     self._labels[index]["canny"],
                     canny_views[index],
@@ -213,12 +226,12 @@ class DualInvertApp:
 
             for index in missing_indices:
                 if index in self._labels:
-                    for key in ("original", "inverted", "canny"):
+                    for key in ("original", "canny"):
                         if key in self._labels[index]:
                             self._clear_image(self._labels[index][key], (index, key))
                 self._last_frames.pop(index, None)
 
-        self.root.after(100, self._update_loop)
+        self.root.after(self._live_interval_ms, self._update_loop)
 
     def _update_image(self, label: ttk.Label, frame, key: Tuple[int, str]) -> None:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

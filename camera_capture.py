@@ -46,8 +46,10 @@ class MultiCameraCapture:
                 success = False
                 break
 
-            # Limit the capture rate to 10 frames per second when supported.
-            capture.set(cv2.CAP_PROP_FPS, 10)
+            # Drive the live preview at roughly 30 frames per second when
+            # supported by the connected cameras. If the device ignores this
+            # request OpenCV simply retains its default capture rate.
+            capture.set(cv2.CAP_PROP_FPS, 30)
             opened[index] = capture
 
         if not success:
