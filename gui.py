@@ -169,43 +169,74 @@ class DualInvertApp:
 
     def _update_loop(self) -> None:
         if self._capture.is_running():
+            frames: Dict[int, np.ndarray] = {}
+            inverted_views: Dict[int, np.ndarray] = {}
+            missing_indices: List[int] = []
+
             for index in self._camera_indices:
                 frame = self._capture.read(index)
-                if frame is not None:
-                    original_frame = frame.copy()
-                    inverted = invert(frame)
+                if frame is None:
+                    missing_indices.append(index)
+                    continue
 
-                    self._last_frames.setdefault(index, {})
-                    self._last_frames[index]["original"] = original_frame
-                    self._last_frames[index]["inverted"] = inverted.copy()
+                original_frame = frame.copy()
+                inverted = invert(frame)
 
-                    if index == 0 and "circles" in self._labels[index]:
-                        circle_view = detect_small_circles(frame)
-                        self._last_frames[index]["circles"] = circle_view.copy()
-                        self._update_image(
-                            self._labels[index]["circles"],
-                            circle_view,
-                            (index, "circles"),
-                        )
+                frames[index] = original_frame
+                inverted_views[index] = inverted
 
-                    self._update_image(
-                        self._labels[index]["original"],
-                        original_frame,
-                        (index, "original"),
-                    )
-                    self._update_image(
-                        self._labels[index]["inverted"],
-                        inverted,
-                        (index, "inverted"),
-                    )
-                else:
+                self._last_frames.setdefault(index, {})
+                self._last_frames[index]["original"] = original_frame.copy()
+                self._last_frames[index]["inverted"] = inverted.copy()
+
+            for index, original_frame in frames.items():
+                self._update_image(
+                    self._labels[index]["original"],
+                    original_frame,
+                    (index, "original"),
+                )
+                self._update_image(
+                    self._labels[index]["inverted"],
+                    inverted_views[index],
+                    (index, "inverted"),
+                )
+
+            for index in missing_indices:
+                if index in self._labels:
                     self._clear_image(self._labels[index]["original"], (index, "original"))
                     self._clear_image(self._labels[index]["inverted"], (index, "inverted"))
                     if "circles" in self._labels[index]:
                         self._clear_image(
                             self._labels[index]["circles"], (index, "circles")
                         )
-                    self._last_frames.pop(index, None)
+                self._last_frames.pop(index, None)
+
+            if 0 in self._labels and "circles" in self._labels[0]:
+                if 0 in frames:
+                    secondary_inverted = None
+                    for other_index in self._camera_indices:
+                        if other_index == 0:
+                            continue
+                        if other_index in inverted_views:
+                            secondary_inverted = inverted_views[other_index]
+                            break
+
+                    circle_view = detect_small_circles(
+                        frames[0],
+                        inverted_views.get(0),
+                        secondary_inverted,
+                    )
+                    self._last_frames.setdefault(0, {})
+                    self._last_frames[0]["circles"] = circle_view.copy()
+                    self._update_image(
+                        self._labels[0]["circles"],
+                        circle_view,
+                        (0, "circles"),
+                    )
+                else:
+                    self._clear_image(self._labels[0]["circles"], (0, "circles"))
+                    if 0 in self._last_frames:
+                        self._last_frames[0].pop("circles", None)
 
         self.root.after(33, self._update_loop)
 

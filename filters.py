@@ -82,51 +82,24 @@ def _select_dominant_radius(
     return selected, average_radius
 
 
-def _refine_ring_points(
-    points: np.ndarray, max_iterations: int = 5
-) -> Tuple[np.ndarray, Tuple[float, float, float]]:
-    """Iteratively remove outliers until the circle fit stabilises."""
+def detect_small_circles(
+    frame: np.ndarray,
+    inverted_primary: np.ndarray | None = None,
+    inverted_secondary: np.ndarray | None = None,
+) -> np.ndarray:
+    """Combine inverted feeds and Canny edges to detect flange geometry.
 
-    active_mask = np.ones(len(points), dtype=bool)
-    circle_parameters: Tuple[float, float, float] | None = None
+    The filter operates on camera 0 and expects the original frame together with
+    the inverted representations of camera 0 and camera 1. Both inverted views
+    are converted to grayscale, merged, and processed using a Canny edge
+    detector. The resulting edge map is searched for two circle populations:
 
-    for _ in range(max_iterations):
-        active_indices = np.flatnonzero(active_mask)
-        if len(active_indices) < 4:
-            break
+    * the largest outer circle representing the flange and
+    * at least three similarly sized circles representing the bolt holes.
 
-        cx, cy, radius = _fit_circle_least_squares(points[active_indices])
-        circle_parameters = (cx, cy, radius)
-
-        distances = np.linalg.norm(points[active_indices] - np.array([cx, cy]), axis=1)
-        deviation = np.abs(distances - radius)
-        allowed_deviation = max(3.0, 0.08 * radius)
-        keep_mask = deviation <= allowed_deviation
-        if np.all(keep_mask):
-            break
-
-        # Remove outliers from the active set and repeat.
-        active_mask[active_indices[~keep_mask]] = False
-
-    if circle_parameters is None:
-        raise ValueError("Unable to fit circle to the provided points")
-
-    final_indices = np.flatnonzero(active_mask)
-    if len(final_indices) >= 3:
-        cx, cy, radius = _fit_circle_least_squares(points[final_indices])
-        circle_parameters = (cx, cy, radius)
-
-    return final_indices, circle_parameters
-
-
-def detect_small_circles(frame: np.ndarray) -> np.ndarray:
-    """Detect flange patterns consisting of a large circle and bolt holes.
-
-    The filter searches for 4-18 small circles with a shared radius that lie on a
-    common mid-circle. If such a constellation is found, the average radius of the
-    small circles is used to render the detections. The outer flange diameter is
-    derived from the same centre so that only consistent geometries are
-    highlighted.
+    All confirmed bolt holes are rendered with the averaged radius of the
+    dominant cluster. The detected flange outline and the fitted mid-circle are
+    annotated together with a small preview of the combined Canny edge map.
     """
 
     if frame is None or frame.ndim != 3:
@@ -134,20 +107,45 @@ def detect_small_circles(frame: np.ndarray) -> np.ndarray:
 
     output = frame.copy()
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.medianBlur(gray, 5)
-    gray = cv2.equalizeHist(gray)
+    if inverted_primary is None or inverted_secondary is None:
+        cv2.putText(
+            output,
+            "Invertierte Ansichten fehlen",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return output
 
-    # Detect candidate screw holes.
+    height, width = frame.shape[:2]
+
+    if inverted_primary.shape[:2] != (height, width):
+        inverted_primary = cv2.resize(inverted_primary, (width, height))
+    if inverted_secondary.shape[:2] != (height, width):
+        inverted_secondary = cv2.resize(inverted_secondary, (width, height))
+
+    gray_primary = cv2.cvtColor(inverted_primary, cv2.COLOR_BGR2GRAY)
+    gray_secondary = cv2.cvtColor(inverted_secondary, cv2.COLOR_BGR2GRAY)
+
+    edges_primary = cv2.Canny(gray_primary, 60, 180)
+    edges_secondary = cv2.Canny(gray_secondary, 60, 180)
+    combined_edges = cv2.bitwise_or(edges_primary, edges_secondary)
+
+    blurred_edges = cv2.GaussianBlur(combined_edges, (7, 7), 1.5)
+
+    max_small_radius = max(6, int(round(min(height, width) * 0.12)))
     small_circle_candidates = cv2.HoughCircles(
-        gray,
+        blurred_edges,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
         minDist=12,
-        param1=180,
-        param2=18,
+        param1=160,
+        param2=10,
         minRadius=3,
-        maxRadius=45,
+        maxRadius=max_small_radius,
     )
 
     if small_circle_candidates is None:
@@ -166,10 +164,10 @@ def detect_small_circles(frame: np.ndarray) -> np.ndarray:
     circles = np.round(small_circle_candidates[0]).astype(int)
     circles_list = [(int(x), int(y), int(r)) for x, y, r in circles]
 
-    if len(circles_list) < 4:
+    if len(circles_list) < 3:
         cv2.putText(
             output,
-            "Nicht genügend Schraubenlöcher",
+            "Mindestens 3 Löcher benötigt",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -179,14 +177,15 @@ def detect_small_circles(frame: np.ndarray) -> np.ndarray:
         )
         return output
 
-    dedup_radius = max(4.0, float(np.median([c[2] for c in circles_list])) * 0.6)
+    median_radius = float(np.median([c[2] for c in circles_list]))
+    dedup_radius = max(4.0, 0.6 * median_radius)
     merged_circles = _deduplicate_circles(circles_list, dedup_radius)
 
     selected_circles, avg_small_radius = _select_dominant_radius(merged_circles)
-    if len(selected_circles) < 4 or len(selected_circles) > 18:
+    if len(selected_circles) < 3:
         cv2.putText(
             output,
-            "Kein konsistenter Schraubenloch-Kreis",
+            "Keine stabile Lochgruppe",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -196,112 +195,71 @@ def detect_small_circles(frame: np.ndarray) -> np.ndarray:
         )
         return output
 
-    centers = np.array([(float(x), float(y)) for x, y, _ in selected_circles], dtype=np.float32)
+    normalised_radius = max(1, int(round(avg_small_radius)))
+
+    centres = np.array([(float(x), float(y)) for x, y, _ in selected_circles], dtype=np.float32)
     try:
-        inlier_indices, (mid_cx, mid_cy, mid_radius) = _refine_ring_points(centers)
+        mid_cx, mid_cy, mid_radius = _fit_circle_least_squares(centres)
     except ValueError:
-        cv2.putText(
-            output,
-            "Mittlerer Kreis konnte nicht bestimmt werden",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return output
+        mid_cx = float(np.mean(centres[:, 0]))
+        mid_cy = float(np.mean(centres[:, 1]))
+        radial_distances = np.linalg.norm(centres - np.array([mid_cx, mid_cy]), axis=1)
+        mid_radius = float(np.mean(radial_distances)) if radial_distances.size else float(normalised_radius)
 
-    if len(inlier_indices) < 4 or len(inlier_indices) > 18:
-        cv2.putText(
-            output,
-            "Zu wenige/zu viele Schraubenlöcher",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return output
+    outer_min_radius = max(
+        30,
+        int(round(mid_radius + avg_small_radius * 1.5)),
+        max_small_radius * 2,
+    )
+    outer_max_radius = int(round(min(math.hypot(width, height) / 2.0, min(height, width) * 0.95)))
 
-    inlier_circles = [selected_circles[int(idx)] for idx in inlier_indices]
-    inlier_centers = centers[inlier_indices]
-
-    # Validate the angular distribution to suppress false positives.
-    vectors = inlier_centers - np.array([mid_cx, mid_cy])
-    angles = np.degrees(np.arctan2(vectors[:, 1], vectors[:, 0]))
-    angles = np.sort((angles + 360.0) % 360.0)
-    diffs = np.diff(np.concatenate([angles, angles[:1] + 360.0]))
-    min_sep = float(diffs.min()) if len(diffs) else 360.0
-    coverage = 360.0 - float(diffs.max()) if len(diffs) else 0.0
-
-    if min_sep < 10.0 or coverage < 180.0:
-        cv2.putText(
-            output,
-            "Schraubenlöcher nicht rund verteilt",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return output
-
-    avg_small_radius = float(np.mean([c[2] for c in inlier_circles]))
-    normalised_radius = int(round(avg_small_radius))
-
-    # Determine the flange diameter (outer circle) close to the fitted centre.
     flange_circle = None
-    min_outer_radius = int(round(mid_radius + avg_small_radius * 1.2))
-    max_outer_radius = int(round(mid_radius * 1.9 + avg_small_radius))
-    if max_outer_radius > min_outer_radius + 2:
+    if outer_max_radius > outer_min_radius:
         large_circle_candidates = cv2.HoughCircles(
-            gray,
+            blurred_edges,
             cv2.HOUGH_GRADIENT,
-            dp=1.0,
-            minDist=max(30, int(mid_radius * 0.5)),
-            param1=200,
-            param2=60,
-            minRadius=min_outer_radius,
-            maxRadius=max_outer_radius,
+            dp=1.1,
+            minDist=max(40, int(round(mid_radius))),
+            param1=180,
+            param2=25,
+            minRadius=outer_min_radius,
+            maxRadius=outer_max_radius,
         )
         if large_circle_candidates is not None:
             candidate_list = np.round(large_circle_candidates[0]).astype(int)
-            filtered_candidates = []
-            for x, y, r in candidate_list:
-                if r <= min_outer_radius:
-                    continue
-                center_distance = math.hypot(x - mid_cx, y - mid_cy)
-                if center_distance > max(20.0, 0.2 * mid_radius):
-                    continue
-                filtered_candidates.append((x, y, r))
-
-            if filtered_candidates:
-                flange_circle = max(filtered_candidates, key=lambda c: c[2])
+            sorted_candidates = sorted(
+                [(int(x), int(y), int(r)) for x, y, r in candidate_list],
+                key=lambda c: c[2],
+                reverse=True,
+            )
+            for candidate in sorted_candidates:
+                distance = math.hypot(candidate[0] - mid_cx, candidate[1] - mid_cy)
+                if distance <= max(30.0, 0.25 * max(mid_radius, 1.0)):
+                    flange_circle = candidate
+                    break
+            if flange_circle is None and sorted_candidates:
+                flange_circle = sorted_candidates[0]
 
     if flange_circle is None:
         flange_circle = (
             int(round(mid_cx)),
             int(round(mid_cy)),
-            int(round(mid_radius + avg_small_radius * 1.6)),
+            int(round(mid_radius + avg_small_radius * 2.2)),
         )
 
     flange_cx, flange_cy, flange_radius = flange_circle
 
-    # Draw flange and mid-circle.
     cv2.circle(output, (flange_cx, flange_cy), flange_radius, (255, 0, 0), 2)
     cv2.circle(output, (int(round(mid_cx)), int(round(mid_cy))), int(round(mid_radius)), (0, 255, 255), 1)
     cv2.circle(output, (int(round(mid_cx)), int(round(mid_cy))), 3, (0, 0, 255), -1)
 
-    for x, y, _ in inlier_circles:
+    for x, y, _ in selected_circles:
         cv2.circle(output, (int(x), int(y)), normalised_radius, (0, 255, 0), 2)
         cv2.circle(output, (int(x), int(y)), 2, (0, 255, 0), -1)
 
     cv2.putText(
         output,
-        f"Loecher: {len(inlier_circles)}  r={normalised_radius}px",
+        f"Loecher: {len(selected_circles)}  r={normalised_radius}px",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
@@ -311,13 +269,57 @@ def detect_small_circles(frame: np.ndarray) -> np.ndarray:
     )
     cv2.putText(
         output,
-        f"Mittenkreis: {int(round(mid_radius))}px  Flansch: {flange_radius}px",
+        f"Flansch: {flange_radius}px  Mitte: {int(round(mid_radius))}px",
         (10, 55),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
-        (0, 255, 255),
+        (255, 255, 0),
         2,
         cv2.LINE_AA,
     )
+    cv2.putText(
+        output,
+        "Basis: invertiert + Canny (Cam0+1)",
+        (10, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
+
+    preview_height = min(120, max(30, height // 3))
+    preview_width = max(30, int(round(preview_height * width / max(height, 1))))
+    preview_width = min(preview_width, max(30, width - 20))
+    if (
+        preview_height > 0
+        and preview_width > 0
+        and preview_height + 20 < height
+        and preview_width + 20 < width
+    ):
+        preview_edges = cv2.resize(combined_edges, (preview_width, preview_height))
+        preview_bgr = cv2.cvtColor(preview_edges, cv2.COLOR_GRAY2BGR)
+        y0 = height - preview_height - 10
+        x0 = width - preview_width - 10
+        roi = output[y0 : y0 + preview_height, x0 : x0 + preview_width]
+        blended = cv2.addWeighted(preview_bgr, 0.6, roi, 0.4, 0.0)
+        output[y0 : y0 + preview_height, x0 : x0 + preview_width] = blended
+        cv2.rectangle(
+            output,
+            (x0, y0),
+            (x0 + preview_width, y0 + preview_height),
+            (0, 255, 255),
+            1,
+        )
+        cv2.putText(
+            output,
+            "Canny Merge",
+            (x0 + 5, y0 + preview_height - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     return output
