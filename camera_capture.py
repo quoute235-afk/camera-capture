@@ -86,3 +86,36 @@ class MultiCameraCapture:
         """Yield the configured camera indices in the initial order."""
 
         return iter(self._indices)
+
+    def refresh_autofocus(self) -> bool:
+        """Attempt to retrigger auto focus on all opened cameras.
+
+        Returns
+        -------
+        bool
+            ``True`` if at least one capture acknowledged the autofocus
+            command, otherwise ``False``.
+        """
+
+        if not self.is_running():
+            return False
+
+        autofocus_prop = getattr(cv2, "CAP_PROP_AUTOFOCUS", None)
+        if autofocus_prop is None:
+            return False
+
+        refreshed = False
+        for capture in self._captures.values():
+            if capture is None or not capture.isOpened():
+                continue
+
+            # Toggle the autofocus flag to encourage the camera to refocus.
+            if capture.set(autofocus_prop, 0) and capture.set(autofocus_prop, 1):
+                refreshed = True
+                continue
+
+            # Some devices only allow enabling autofocus without toggling.
+            if capture.set(autofocus_prop, 1):
+                refreshed = True
+
+        return refreshed
