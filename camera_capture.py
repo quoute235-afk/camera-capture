@@ -23,7 +23,7 @@ class MultiCameraCapture:
     def __init__(
         self,
         camera_indices: Iterable[int],
-        frame_size: Optional[Tuple[int, int]] = (640, 360),
+        frame_size: Optional[Tuple[int, int]] = (640, 480),
         backend: int = cv2.CAP_ANY,
     ) -> None:
         self._indices = list(camera_indices)
