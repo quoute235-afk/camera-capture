@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 from datetime import datetime
 from pathlib import Path
 import time
@@ -15,9 +16,12 @@ from tkinter import ttk
 from camera_capture import MultiCameraCapture
 from filters import canny_from_inverted, invert_grayscale
 from stereo_reconstruction import (
+    StereoCalibrationData,
     StereoReconstructor,
+    compute_stereo_calibration,
     create_default_matcher,
     load_calibration,
+    save_calibration,
 )
 
 
@@ -39,6 +43,11 @@ class DualInvertApp:
         self._stereo_pair: Optional[Tuple[int, int]] = None
         self._stereo_calibration_size: Optional[Tuple[int, int]] = None
         self._load_stereo_configuration()
+
+        self._calibration_in_progress = False
+        self._calibration_pattern_size: Tuple[int, int] = (6, 6)
+        self._calibration_target_pairs = 18
+        self._calibration_min_pairs = 12
 
         capture_frame_size = self._stereo_calibration_size or (640, 360)
         self._capture = MultiCameraCapture(
@@ -82,6 +91,13 @@ class DualInvertApp:
             command=self.refresh_autofocus,
         )
         autofocus_button.pack(fill=tk.X, pady=(5, 0))
+
+        calibrate_button = ttk.Button(
+            control_frame,
+            text="Stereo Kalibrierung",
+            command=self.start_calibration,
+        )
+        calibrate_button.pack(fill=tk.X, pady=(5, 0))
 
         quit_button = ttk.Button(control_frame, text="Beenden", command=self.on_close)
         quit_button.pack(fill=tk.X, pady=(5, 0))
@@ -189,6 +205,165 @@ class DualInvertApp:
     def stop_cameras(self) -> None:
         self._capture.stop()
         self.status_var.set("Aufnahme gestoppt.")
+        self._last_canny_timestamp = None
+
+    def start_calibration(self) -> None:
+        if len(self._camera_indices) < 2:
+            self.status_var.set("Kalibrierung benötigt zwei Kameras.")
+            return
+
+        if self._calibration_in_progress:
+            self.status_var.set("Kalibrierung läuft bereits.")
+            return
+
+        started_for_calibration = False
+        if not self._capture.is_running():
+            if not self._capture.start():
+                self.status_var.set("Kalibrierung fehlgeschlagen: Kameras nicht verfügbar.")
+                self._capture.stop()
+                return
+            started_for_calibration = True
+
+        self._calibration_in_progress = True
+        self.status_var.set(
+            "Kalibrierung gestartet – Schachbrett in verschiedenen Positionen zeigen."
+        )
+
+        left_index, right_index = self._camera_indices[0], self._camera_indices[1]
+
+        thread = threading.Thread(
+            target=self._run_calibration_capture,
+            args=(left_index, right_index, started_for_calibration),
+            daemon=True,
+        )
+        thread.start()
+
+    def _detect_chessboard(self, image: np.ndarray) -> bool:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        flags = getattr(cv2, "CALIB_CB_FAST_CHECK", 0)
+        found, _ = cv2.findChessboardCorners(gray, self._calibration_pattern_size, flags)
+        return bool(found)
+
+    def _run_calibration_capture(
+        self, left_index: int, right_index: int, started_for_calibration: bool
+    ) -> None:
+        pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+        capture_dir: Optional[Path] = None
+        start_time = time.perf_counter()
+        timeout_seconds = 60
+
+        try:
+            while len(pairs) < self._calibration_target_pairs:
+                if not self._capture.is_running():
+                    break
+
+                left_frame = self._capture.read(left_index)
+                right_frame = self._capture.read(right_index)
+
+                if left_frame is None or right_frame is None:
+                    time.sleep(0.1)
+                    if time.perf_counter() - start_time > timeout_seconds:
+                        break
+                    continue
+
+                if self._detect_chessboard(left_frame) and self._detect_chessboard(right_frame):
+                    if capture_dir is None:
+                        timestamp = datetime.now().strftime("calib_%Y%m%d_%H%M%S")
+                        capture_dir = Path("calibration_captures") / timestamp
+                        capture_dir.mkdir(parents=True, exist_ok=True)
+
+                    pair_index = len(pairs) + 1
+                    left_copy = left_frame.copy()
+                    right_copy = right_frame.copy()
+                    pairs.append((left_copy, right_copy))
+
+                    cv2.imwrite(str(capture_dir / f"left_{pair_index:02d}.png"), left_copy)
+                    cv2.imwrite(str(capture_dir / f"right_{pair_index:02d}.png"), right_copy)
+
+                    self.root.after(
+                        0,
+                        self.status_var.set,
+                        f"Kalibrierung: {pair_index}/{self._calibration_target_pairs} Paare erfasst.",
+                    )
+
+                    time.sleep(0.3)
+                else:
+                    time.sleep(0.05)
+
+                if time.perf_counter() - start_time > timeout_seconds:
+                    break
+
+            if len(pairs) < self._calibration_min_pairs:
+                message = (
+                    "Kalibrierung fehlgeschlagen: zu wenige gültige Schachbrettpaare gefunden."
+                )
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            try:
+                calibration = compute_stereo_calibration(
+                    pairs,
+                    pattern_size=self._calibration_pattern_size,
+                )
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                message = f"Kalibrierung fehlgeschlagen: {exc}"
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            try:
+                save_calibration(Path("stereo_calibration.json"), calibration)
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                message = f"Kalibrierung konnte nicht gespeichert werden: {exc}"
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            message = f"Kalibrierung abgeschlossen ({len(pairs)} Paare)."
+            self.root.after(
+                0,
+                self._finish_calibration,
+                True,
+                message,
+                calibration,
+                capture_dir,
+            )
+        finally:
+            if started_for_calibration:
+                self.root.after(0, self._stop_capture_after_calibration)
+
+    def _finish_calibration(
+        self,
+        success: bool,
+        message: str,
+        calibration: Optional[StereoCalibrationData] = None,
+        capture_dir: Optional[Path] = None,
+    ) -> None:
+        if success and calibration is not None:
+            self._apply_new_calibration(calibration)
+        if success and capture_dir is not None:
+            try:
+                relative_dir = capture_dir.relative_to(Path.cwd())
+            except ValueError:
+                relative_dir = capture_dir
+            message = f"{message} Bilder unter '{relative_dir}' gespeichert."
+        self.status_var.set(message)
+        self._calibration_in_progress = False
+
+    def _apply_new_calibration(self, calibration: StereoCalibrationData) -> None:
+        width, height = calibration.image_size
+        self._stereo_calibration_size = (int(width), int(height))
+        if len(self._camera_indices) >= 2:
+            self._stereo_pair = (self._camera_indices[0], self._camera_indices[1])
+        self._stereo_renderer = StereoReconstructor(
+            calibration, matcher=create_default_matcher()
+        )
+        self._stereo_status = None
+        if self._stereo_pair is not None:
+            label = self._labels.get(self._stereo_pair[0], {}).get("3d")
+            if label is not None:
+                label.configure(text="Warte auf Stereo-Daten")
+
+    def _stop_capture_after_calibration(self) -> None:
+        self._capture.stop()
         self._last_canny_timestamp = None
 
     def on_close(self) -> None:

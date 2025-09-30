@@ -6,41 +6,50 @@ Stereo-Kalibrierung vorliegt – eine 3D-Tiefenansicht erzeugt.
 
 ## Stereo-Kalibrierung durchführen
 
-1. **Schachbrett aufnehmen**  
-   Nimm pro Kamera mehrere synchronisierte Bilder des 6×6-Kalibrierfeldes auf.
-   Die Bilder beider Kameras müssen jeweils dieselbe Auflösung besitzen.
+1. **Kalibrierung starten**
+   Öffne die Anwendung (`python -m dual_invert_app`) und stelle sicher, dass beide
+   Kameras sichtbar sind. Drücke anschließend im linken Bedienfeld auf
+   **„Stereo Kalibrierung“**. Die Anwendung startet die Kameras automatisch,
+   falls sie zuvor gestoppt waren.
 
-2. **Kalibrierung berechnen**  
-   Verwende das Modul `stereo_reconstruction.py`, um aus den Bildpaaren die
-   Intrinsik und Extrinsik der Kameras zu bestimmen:
+2. **Schachbrett bewegen**
+   Halte das 6×6-Schachbrett nacheinander in verschiedene Positionen und
+   Blickrichtungen. Sobald beide Kameras ein gültiges Muster erkennen, zeichnet
+   die Anwendung ein Bildpaar auf und zeigt den Fortschritt im Statusfeld an.
+   Ziel sind 18 gültige Paare (mindestens 12 sind erforderlich).
 
-   ```python
-   from pathlib import Path
+3. **Automatisches Speichern**
+   Nach erfolgreicher Auswertung speichert die Anwendung
+   `stereo_calibration.json` im Projektstammverzeichnis und legt sämtliche
+   verwendeten Bilder im Ordner `calibration_captures/<timestamp>/` ab.
+   Anschließend steht die Stereo-Ansicht sofort zur Verfügung.
 
-   import cv2
-   import stereo_reconstruction as sr
+### Alternative: Kalibrierung per Skript
 
-   # Beispiel: Bilder aus einem Ordner laden
-   pairs = []
-   for i in range(1, 21):
-       left = cv2.imread(f"calib/left_{i:02d}.png")
-       right = cv2.imread(f"calib/right_{i:02d}.png")
-       if left is None or right is None:
-           continue
-       pairs.append((left, right))
+Falls du lieber offline mit bereits vorhandenen Bildern arbeiten möchtest,
+kannst du weiterhin `stereo_reconstruction.py` direkt verwenden. Sammle deine
+Bildpaare in einem Ordner und führe beispielsweise folgendes Snippet aus:
 
-   calibration = sr.compute_stereo_calibration(pairs, pattern_size=(6, 6), square_size=1.0)
-   sr.save_calibration(Path("stereo_calibration.json"), calibration)
-   ```
+```python
+from pathlib import Path
 
-   Das Script erkennt automatisch gültige Schachbrettpaare, optimiert die Ecke
-   subpixelgenau und speichert alle Parameter samt Reprojektionsfehler.
+import cv2
+import stereo_reconstruction as sr
 
-3. **Datei ablegen**  
-   Lege die erzeugte `stereo_calibration.json` im Projektstammverzeichnis ab.
-   Die GUI lädt die Datei beim Start und zeigt in der ersten Kamerazeile ein
-   zusätzliches Panel **„3D Ansicht“** an. Fehlt die Kalibrierung, bleibt das
-   Panel mit einem Hinweis deaktiviert.
+pairs = []
+for i in range(1, 21):
+    left = cv2.imread(f"calib/left_{i:02d}.png")
+    right = cv2.imread(f"calib/right_{i:02d}.png")
+    if left is None or right is None:
+        continue
+    pairs.append((left, right))
+
+calibration = sr.compute_stereo_calibration(pairs, pattern_size=(6, 6), square_size=1.0)
+sr.save_calibration(Path("stereo_calibration.json"), calibration)
+```
+
+Die erzeugte Datei wird von der Anwendung beim nächsten Start automatisch
+geladen.
 
 ## Live-Bedienung
 
