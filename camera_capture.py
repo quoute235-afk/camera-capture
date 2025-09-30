@@ -1,6 +1,7 @@
 """Camera capture management for multi-camera setups."""
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Dict, Iterable, Optional, Tuple
 
 import cv2
@@ -31,26 +32,79 @@ class MultiCameraCapture:
         self._backend = backend
         self._captures: Dict[int, cv2.VideoCapture] = {}
 
+    def _open_single_capture(self, index: int) -> Optional[cv2.VideoCapture]:
+        """Create and initialize a single ``VideoCapture`` instance."""
+
+        capture = cv2.VideoCapture(index, self._backend)
+        capture.set(cv2.CAP_PROP_FPS, 30)
+        if not capture.isOpened():
+            capture.release()
+            return None
+        return capture
+
     def start(self) -> bool:
         """Open all configured camera indices."""
 
         if self.is_running():
             return True
 
-        opened: Dict[int, cv2.VideoCapture] = {}
-        success = True
-        for index in self._indices:
-            capture = cv2.VideoCapture(index, self._backend)
-            if not capture.isOpened():
-                capture.release()
-                success = False
-                break
-            opened[index] = capture
+        def open_sequential() -> Optional[Dict[int, cv2.VideoCapture]]:
+            sequential_opened: Dict[int, cv2.VideoCapture] = {}
+            for cam_index in self._indices:
+                capture = self._open_single_capture(cam_index)
+                if capture is None:
+                    for handle in sequential_opened.values():
+                        handle.release()
+                    return None
+                sequential_opened[cam_index] = capture
+            return sequential_opened
 
-        if not success:
-            for capture in opened.values():
-                capture.release()
-            return False
+        if len(self._indices) <= 1:
+            sequential_result = open_sequential()
+            if sequential_result is None:
+                return False
+            self._captures = sequential_result
+            return True
+
+        opened: Dict[int, cv2.VideoCapture] = {}
+        try:
+            failure_detected = False
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(self._indices)
+            ) as executor:
+                futures = {
+                    executor.submit(self._open_single_capture, index): index
+                    for index in self._indices
+                }
+
+                for future in concurrent.futures.as_completed(futures):
+                    index = futures[future]
+                    try:
+                        capture = future.result()
+                    except Exception:
+                        capture = None
+
+                    if capture is None:
+                        failure_detected = True
+                        continue
+
+                    if failure_detected:
+                        capture.release()
+                        continue
+
+                    opened[index] = capture
+
+            if failure_detected:
+                for capture in opened.values():
+                    capture.release()
+                return False
+
+        except Exception:
+            sequential_result = open_sequential()
+            if sequential_result is None:
+                return False
+            self._captures = sequential_result
+            return True
 
         self._captures = opened
         return True

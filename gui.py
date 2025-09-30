@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import tkinter as tk
 from tkinter import ttk
+import threading
 
 from camera_capture import MultiCameraCapture
 from filters import invert
@@ -30,6 +31,7 @@ class DualInvertApp:
         self._capture = MultiCameraCapture(self._camera_indices)
         self._photo_images: Dict[Tuple[int, str], tk.PhotoImage] = {}
         self._last_frames: Dict[int, Dict[str, np.ndarray]] = {}
+        self._start_in_progress = False
 
         self.status_var = tk.StringVar(value="Inaktiv. Bitte 'Start' drücken.")
 
@@ -107,15 +109,28 @@ class DualInvertApp:
         return image_label
 
     def start_cameras(self) -> None:
-        if self._capture.is_running():
+        if self._capture.is_running() or self._start_in_progress:
             return
 
-        if not self._capture.start():
-            self.status_var.set("Fehler beim Öffnen der Kameras.")
-            self._capture.stop()
-            return
+        self._start_in_progress = True
+        self.status_var.set("Initialisiere Kameras…")
 
-        self.status_var.set("Live-Ansicht aktiv.")
+        def finalize_start(success: bool) -> None:
+            if success:
+                self.status_var.set("Live-Ansicht aktiv.")
+            else:
+                self.status_var.set("Fehler beim Öffnen der Kameras.")
+                self._capture.stop()
+            self._start_in_progress = False
+
+        def open_cameras() -> None:
+            try:
+                success = self._capture.start()
+            except Exception:
+                success = False
+            self.root.after(0, lambda: finalize_start(success))
+
+        threading.Thread(target=open_cameras, daemon=True).start()
 
     def stop_cameras(self) -> None:
         self._capture.stop()
