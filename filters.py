@@ -1,29 +1,37 @@
-"""Image processing filters for camera frames."""
+"""Grayscale inversion and Canny edge filters for camera frames."""
 from __future__ import annotations
+
+from typing import Tuple
 
 import cv2
 import numpy as np
 
 
-def invert(frame: np.ndarray) -> np.ndarray:
-    """Return a grayscale-inverted frame with red contours highlighting edges.
+def invert_grayscale(frame: np.ndarray) -> np.ndarray:
+    """Convert *frame* to grayscale, invert it, and return a 3-channel image."""
 
-    The input frame is converted to grayscale, inverted, and then converted
-    back to a 3-channel image so it can be rendered alongside color frames in
-    the GUI. Canny edge detection is used to extract the dominant geometry and
-    the detected contours are traced with a red outline for better visibility.
-    """
-    # Convert to grayscale to ensure the inversion only affects luminance.
+    if frame is None or frame.ndim != 3:
+        return frame
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    inverted = cv2.bitwise_not(gray)
+    return cv2.cvtColor(inverted, cv2.COLOR_GRAY2BGR)
 
-    # Invert the grayscale image and convert it back to BGR for display.
-    inverted_gray = cv2.bitwise_not(gray)
-    inverted_bgr = cv2.cvtColor(inverted_gray, cv2.COLOR_GRAY2BGR)
 
-    # Detect edges and outline their contours in red to highlight geometry.
-    edges = cv2.Canny(gray, 100, 200)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        cv2.drawContours(inverted_bgr, contours, -1, (0, 0, 255), 1)
+def canny_from_inverted(
+    frame: np.ndarray, thresholds: Tuple[int, int] = (60, 180)
+) -> np.ndarray:
+    """Compute a black and white Canny edge map from an inverted image."""
 
-    return inverted_bgr
+    if frame is None:
+        return frame
+
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    elif frame.ndim == 2:
+        gray = frame
+    else:
+        return frame
+
+    edges = cv2.Canny(gray, thresholds[0], thresholds[1])
+    return cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)

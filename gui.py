@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+import time
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -12,11 +14,19 @@ import tkinter as tk
 from tkinter import ttk
 
 from camera_capture import MultiCameraCapture
-from filters import invert
+from filters import canny_from_inverted, invert_grayscale
+from stereo_reconstruction import (
+    StereoCalibrationData,
+    StereoReconstructor,
+    compute_stereo_calibration,
+    create_default_matcher,
+    load_calibration,
+    save_calibration,
+)
 
 
 class DualInvertApp:
-    """GUI application showing original and inverted views for cameras."""
+    """GUI application showing original and processed views for cameras."""
 
     def __init__(
         self,
@@ -27,11 +37,31 @@ class DualInvertApp:
         self.root.title("Dual Kamera Ansicht mit Invertierung")
 
         self._camera_indices: List[int] = list(camera_indices)
-        self._capture = MultiCameraCapture(self._camera_indices)
+
+        self._stereo_renderer: Optional[StereoReconstructor] = None
+        self._stereo_status: Optional[str] = None
+        self._stereo_pair: Optional[Tuple[int, int]] = None
+        self._stereo_calibration_size: Optional[Tuple[int, int]] = None
+        self._load_stereo_configuration()
+
+        self._calibration_in_progress = False
+        self._calibration_pattern_size: Tuple[int, int] = (6, 6)
+        self._calibration_target_pairs = 18
+        self._calibration_min_pairs = 12
+
+        capture_frame_size = self._stereo_calibration_size or (640, 360)
+        self._capture = MultiCameraCapture(
+            self._camera_indices,
+            frame_size=capture_frame_size,
+        )
         self._photo_images: Dict[Tuple[int, str], tk.PhotoImage] = {}
         self._last_frames: Dict[int, Dict[str, np.ndarray]] = {}
+        self._live_interval_ms = 33  # ~30 FPS for the live preview
+        self._canny_interval_ms = 150  # ~6-7 FPS for the Canny view
+        self._last_canny_timestamp: Optional[float] = None
 
-        self.status_var = tk.StringVar(value="Inaktiv. Bitte 'Start' drücken.")
+        initial_status = self._stereo_status or "Inaktiv. Bitte 'Start' drücken."
+        self.status_var = tk.StringVar(value=initial_status)
 
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -62,6 +92,13 @@ class DualInvertApp:
         )
         autofocus_button.pack(fill=tk.X, pady=(5, 0))
 
+        calibrate_button = ttk.Button(
+            control_frame,
+            text="Stereo Kalibrierung",
+            command=self.start_calibration,
+        )
+        calibrate_button.pack(fill=tk.X, pady=(5, 0))
+
         quit_button = ttk.Button(control_frame, text="Beenden", command=self.on_close)
         quit_button.pack(fill=tk.X, pady=(5, 0))
 
@@ -73,20 +110,66 @@ class DualInvertApp:
 
         self._labels: Dict[int, Dict[str, ttk.Label]] = {}
 
+        max_column_index = 0
+
         for row, index in enumerate(self._camera_indices):
-            self._labels[index] = {
-                "original": self._create_image_panel(
-                    video_frame, f"Kamera {row + 1} - Original", row, 0
-                ),
-                "inverted": self._create_image_panel(
-                    video_frame, f"Kamera {row + 1} - Invertiert", row, 1
-                ),
-            }
+            panel_config = [
+                ("original", "Original", "Kein Signal"),
+                ("canny", "Canny (Invertiert)", "Kein Signal"),
+            ]
+            if row == 0 and len(self._camera_indices) >= 2:
+                default_text = (
+                    "Warte auf Stereo-Daten"
+                    if self._stereo_renderer is not None
+                    else (self._stereo_status or "Stereo deaktiviert")
+                )
+                panel_config.append(("3d", "3D Ansicht", default_text))
+            max_column_index = max(max_column_index, len(panel_config) - 1)
+
+            row_labels: Dict[str, ttk.Label] = {}
+            for column, (key, title_suffix, default_text) in enumerate(panel_config):
+                row_labels[key] = self._create_image_panel(
+                    video_frame,
+                    f"Kamera {row + 1} - {title_suffix}",
+                    row,
+                    column,
+                    default_text=default_text,
+                )
+            self._labels[index] = row_labels
 
         for row in range(len(self._camera_indices)):
             video_frame.grid_rowconfigure(row, weight=1)
-        for column in range(2):
+        for column in range(max_column_index + 1):
             video_frame.grid_columnconfigure(column, weight=1)
+
+    def _load_stereo_configuration(self) -> None:
+        self._stereo_renderer = None
+        self._stereo_calibration_size = None
+        self._stereo_pair = None
+        self._stereo_status = None
+
+        if len(self._camera_indices) < 2:
+            self._stereo_status = "Stereo-Ansicht benötigt zwei Kameras."
+            return
+
+        self._stereo_pair = (self._camera_indices[0], self._camera_indices[1])
+        calibration_path = Path("stereo_calibration.json")
+        if not calibration_path.exists():
+            self._stereo_status = (
+                f"Stereo-Ansicht deaktiviert: '{calibration_path.name}' fehlt."
+            )
+            return
+
+        try:
+            calibration = load_calibration(calibration_path)
+        except Exception as exc:  # pragma: no cover - defensive for GUI usage
+            self._stereo_status = f"Stereo-Ansicht deaktiviert: {exc}"
+            return
+
+        width, height = calibration.image_size
+        self._stereo_calibration_size = (int(width), int(height))
+        matcher = create_default_matcher()
+        self._stereo_renderer = StereoReconstructor(calibration, matcher=matcher)
 
     def _create_image_panel(
         self,
@@ -94,6 +177,7 @@ class DualInvertApp:
         title: str,
         row: int,
         column: int,
+        default_text: str = "Kein Signal",
     ) -> ttk.Label:
         panel = ttk.Frame(parent)
         panel.grid(row=row, column=column, padx=5, pady=5, sticky="nsew")
@@ -101,7 +185,7 @@ class DualInvertApp:
         label_title = ttk.Label(panel, text=title, anchor="center")
         label_title.pack(fill=tk.X)
 
-        image_label = ttk.Label(panel, text="Kein Signal", anchor="center")
+        image_label = ttk.Label(panel, text=default_text, anchor="center")
         image_label.pack(fill=tk.BOTH, expand=True)
 
         return image_label
@@ -116,10 +200,171 @@ class DualInvertApp:
             return
 
         self.status_var.set("Live-Ansicht aktiv.")
+        self._last_canny_timestamp = None
 
     def stop_cameras(self) -> None:
         self._capture.stop()
         self.status_var.set("Aufnahme gestoppt.")
+        self._last_canny_timestamp = None
+
+    def start_calibration(self) -> None:
+        if len(self._camera_indices) < 2:
+            self.status_var.set("Kalibrierung benötigt zwei Kameras.")
+            return
+
+        if self._calibration_in_progress:
+            self.status_var.set("Kalibrierung läuft bereits.")
+            return
+
+        started_for_calibration = False
+        if not self._capture.is_running():
+            if not self._capture.start():
+                self.status_var.set("Kalibrierung fehlgeschlagen: Kameras nicht verfügbar.")
+                self._capture.stop()
+                return
+            started_for_calibration = True
+
+        self._calibration_in_progress = True
+        self.status_var.set(
+            "Kalibrierung gestartet – Schachbrett in verschiedenen Positionen zeigen."
+        )
+
+        left_index, right_index = self._camera_indices[0], self._camera_indices[1]
+
+        thread = threading.Thread(
+            target=self._run_calibration_capture,
+            args=(left_index, right_index, started_for_calibration),
+            daemon=True,
+        )
+        thread.start()
+
+    def _detect_chessboard(self, image: np.ndarray) -> bool:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        flags = getattr(cv2, "CALIB_CB_FAST_CHECK", 0)
+        found, _ = cv2.findChessboardCorners(gray, self._calibration_pattern_size, flags)
+        return bool(found)
+
+    def _run_calibration_capture(
+        self, left_index: int, right_index: int, started_for_calibration: bool
+    ) -> None:
+        pairs: List[Tuple[np.ndarray, np.ndarray]] = []
+        capture_dir: Optional[Path] = None
+        start_time = time.perf_counter()
+        timeout_seconds = 60
+
+        try:
+            while len(pairs) < self._calibration_target_pairs:
+                if not self._capture.is_running():
+                    break
+
+                left_frame = self._capture.read(left_index)
+                right_frame = self._capture.read(right_index)
+
+                if left_frame is None or right_frame is None:
+                    time.sleep(0.1)
+                    if time.perf_counter() - start_time > timeout_seconds:
+                        break
+                    continue
+
+                if self._detect_chessboard(left_frame) and self._detect_chessboard(right_frame):
+                    if capture_dir is None:
+                        timestamp = datetime.now().strftime("calib_%Y%m%d_%H%M%S")
+                        capture_dir = Path("calibration_captures") / timestamp
+                        capture_dir.mkdir(parents=True, exist_ok=True)
+
+                    pair_index = len(pairs) + 1
+                    left_copy = left_frame.copy()
+                    right_copy = right_frame.copy()
+                    pairs.append((left_copy, right_copy))
+
+                    cv2.imwrite(str(capture_dir / f"left_{pair_index:02d}.png"), left_copy)
+                    cv2.imwrite(str(capture_dir / f"right_{pair_index:02d}.png"), right_copy)
+
+                    self.root.after(
+                        0,
+                        self.status_var.set,
+                        f"Kalibrierung: {pair_index}/{self._calibration_target_pairs} Paare erfasst.",
+                    )
+
+                    time.sleep(0.3)
+                else:
+                    time.sleep(0.05)
+
+                if time.perf_counter() - start_time > timeout_seconds:
+                    break
+
+            if len(pairs) < self._calibration_min_pairs:
+                message = (
+                    "Kalibrierung fehlgeschlagen: zu wenige gültige Schachbrettpaare gefunden."
+                )
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            try:
+                calibration = compute_stereo_calibration(
+                    pairs,
+                    pattern_size=self._calibration_pattern_size,
+                )
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                message = f"Kalibrierung fehlgeschlagen: {exc}"
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            try:
+                save_calibration(Path("stereo_calibration.json"), calibration)
+            except Exception as exc:  # pragma: no cover - runtime safeguard
+                message = f"Kalibrierung konnte nicht gespeichert werden: {exc}"
+                self.root.after(0, self._finish_calibration, False, message, None, capture_dir)
+                return
+
+            message = f"Kalibrierung abgeschlossen ({len(pairs)} Paare)."
+            self.root.after(
+                0,
+                self._finish_calibration,
+                True,
+                message,
+                calibration,
+                capture_dir,
+            )
+        finally:
+            if started_for_calibration:
+                self.root.after(0, self._stop_capture_after_calibration)
+
+    def _finish_calibration(
+        self,
+        success: bool,
+        message: str,
+        calibration: Optional[StereoCalibrationData] = None,
+        capture_dir: Optional[Path] = None,
+    ) -> None:
+        if success and calibration is not None:
+            self._apply_new_calibration(calibration)
+        if success and capture_dir is not None:
+            try:
+                relative_dir = capture_dir.relative_to(Path.cwd())
+            except ValueError:
+                relative_dir = capture_dir
+            message = f"{message} Bilder unter '{relative_dir}' gespeichert."
+        self.status_var.set(message)
+        self._calibration_in_progress = False
+
+    def _apply_new_calibration(self, calibration: StereoCalibrationData) -> None:
+        width, height = calibration.image_size
+        self._stereo_calibration_size = (int(width), int(height))
+        if len(self._camera_indices) >= 2:
+            self._stereo_pair = (self._camera_indices[0], self._camera_indices[1])
+        self._stereo_renderer = StereoReconstructor(
+            calibration, matcher=create_default_matcher()
+        )
+        self._stereo_status = None
+        if self._stereo_pair is not None:
+            label = self._labels.get(self._stereo_pair[0], {}).get("3d")
+            if label is not None:
+                label.configure(text="Warte auf Stereo-Daten")
+
+    def _stop_capture_after_calibration(self) -> None:
+        self._capture.stop()
+        self._last_canny_timestamp = None
 
     def on_close(self) -> None:
         self.stop_cameras()
@@ -162,32 +407,111 @@ class DualInvertApp:
 
     def _update_loop(self) -> None:
         if self._capture.is_running():
+            frames: Dict[int, np.ndarray] = {}
+            canny_views: Dict[int, np.ndarray] = {}
+            canny_refresh: List[int] = []
+            missing_indices: List[int] = []
+
+            now = time.perf_counter()
+            update_canny = (
+                self._last_canny_timestamp is None
+                or (now - self._last_canny_timestamp) * 1000 >= self._canny_interval_ms
+            )
+            if update_canny:
+                self._last_canny_timestamp = now
+
             for index in self._camera_indices:
                 frame = self._capture.read(index)
-                if frame is not None:
-                    original_frame = frame.copy()
-                    inverted = invert(frame)
+                if frame is None:
+                    missing_indices.append(index)
+                    continue
 
-                    self._last_frames.setdefault(index, {})
-                    self._last_frames[index]["original"] = original_frame
-                    self._last_frames[index]["inverted"] = inverted.copy()
+                original_frame = frame.copy()
+                frames[index] = original_frame
 
-                    self._update_image(
-                        self._labels[index]["original"],
-                        original_frame,
-                        (index, "original"),
-                    )
-                    self._update_image(
-                        self._labels[index]["inverted"],
-                        inverted,
-                        (index, "inverted"),
-                    )
-                else:
-                    self._clear_image(self._labels[index]["original"], (index, "original"))
-                    self._clear_image(self._labels[index]["inverted"], (index, "inverted"))
-                    self._last_frames.pop(index, None)
+                self._last_frames.setdefault(index, {})
+                self._last_frames[index]["original"] = original_frame.copy()
 
-        self.root.after(33, self._update_loop)
+                stored_canny = self._last_frames[index].get("canny")
+                refresh_canny = update_canny or stored_canny is None
+                if refresh_canny:
+                    inverted = invert_grayscale(original_frame)
+                    stored_canny = canny_from_inverted(inverted)
+                    self._last_frames[index]["canny"] = stored_canny.copy()
+                if stored_canny is not None:
+                    canny_views[index] = stored_canny
+                    if refresh_canny:
+                        canny_refresh.append(index)
+
+            for index, original_frame in frames.items():
+                self._update_image(
+                    self._labels[index]["original"],
+                    original_frame,
+                    (index, "original"),
+                )
+            for index in canny_refresh:
+                self._update_image(
+                    self._labels[index]["canny"],
+                    canny_views[index],
+                    (index, "canny"),
+                )
+
+            if (
+                self._stereo_renderer is not None
+                and self._stereo_pair is not None
+                and update_canny
+            ):
+                left_index, right_index = self._stereo_pair
+                left_frame = frames.get(left_index)
+                right_frame = frames.get(right_index)
+                left_canny = canny_views.get(left_index)
+                right_canny = canny_views.get(right_index)
+
+                if (
+                    left_frame is not None
+                    and right_frame is not None
+                    and left_canny is not None
+                    and right_canny is not None
+                    and "3d" in self._labels.get(left_index, {})
+                ):
+                    try:
+                        result = self._stereo_renderer.compute(
+                            left_frame,
+                            right_frame,
+                            masks=(left_canny, right_canny),
+                        )
+                    except Exception as exc:  # pragma: no cover - runtime safety
+                        self.status_var.set(f"Stereo-Fehler: {exc}")
+                        self._clear_stereo_view(left_index)
+                    else:
+                        depth_view = result.depth_colormap
+                        self._last_frames[left_index]["3d"] = depth_view.copy()
+                        self._update_image(
+                            self._labels[left_index]["3d"],
+                            depth_view,
+                            (left_index, "3d"),
+                        )
+                elif self._stereo_pair[0] in self._labels:
+                    self._clear_stereo_view(self._stereo_pair[0])
+
+            for index in missing_indices:
+                if index in self._labels:
+                    for key in ("original", "canny"):
+                        if key in self._labels[index]:
+                            self._clear_image(self._labels[index][key], (index, key))
+                self._last_frames.pop(index, None)
+
+            if self._stereo_pair is not None:
+                left_index, right_index = self._stereo_pair
+                if (
+                    left_index in missing_indices
+                    or right_index in missing_indices
+                    or left_index not in frames
+                    or right_index not in frames
+                ):
+                    self._clear_stereo_view(left_index)
+
+        self.root.after(self._live_interval_ms, self._update_loop)
 
     def _update_image(self, label: ttk.Label, frame, key: Tuple[int, str]) -> None:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -209,3 +533,17 @@ class DualInvertApp:
             self._last_frames[index].pop(view_name, None)
             if not self._last_frames[index]:
                 self._last_frames.pop(index)
+
+    def _clear_stereo_view(self, left_index: int) -> None:
+        if left_index not in self._labels:
+            return
+        label = self._labels[left_index].get("3d")
+        if label is None:
+            return
+        self._clear_image(label, (left_index, "3d"))
+        message = (
+            "Warte auf Stereo-Daten"
+            if self._stereo_renderer is not None
+            else (self._stereo_status or "Stereo deaktiviert")
+        )
+        label.configure(text=message)
